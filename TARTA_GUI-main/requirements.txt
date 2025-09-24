@@ -1,0 +1,9 @@
+eel
+pandas
+numpy
+scipy
+pytz
+RPi.GPIO
+smbus2
+adafruit-circuitpython-mcp4725
+psutil
