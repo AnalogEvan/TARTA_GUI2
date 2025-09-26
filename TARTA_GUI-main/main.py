@@ -92,24 +92,28 @@ class RPIController:
             self.dac.raw_value = MAX_DAC_VALUE if state else 0
         print(f"Pump DAC set to {'ON' if state else 'OFF'}")
 
-    def _execute_spark_sequence(self):
-        """Executes the precise spark timing sequence using three GPIO pins."""
+   def _execute_spark_sequence(self):
+        """Executes the 4-second ON timing sequence from test.py."""
         if self.gpio_h:
-            # Turn on enable and boost circuits
+            print("SPARK: Turning ON pins 5 (Enable) and 13 (Boost) for 4 seconds.")
+            # Turn on enable and boost circuits as per test.py
             lgpio.gpio_write(self.gpio_h, ENABLE_PIN, 1)
             lgpio.gpio_write(self.gpio_h, BOOST_PIN, 1)
-            time.sleep(0.1)
-            # Fire the relay for the spark
-            lgpio.gpio_write(self.gpio_h, RELAY_PIN, 1)
-            time.sleep(0.05)
-            # Turn everything off in reverse order for safety
-            lgpio.gpio_write(self.gpio_h, RELAY_PIN, 0)
+            
+            # Wait for 4 seconds
+            time.sleep(4)
+            
+            # Turn pins off
             lgpio.gpio_write(self.gpio_h, BOOST_PIN, 0)
             lgpio.gpio_write(self.gpio_h, ENABLE_PIN, 0)
+            print("SPARK: Pins OFF.")
+            # Note: The 2-second OFF period from test.py is partially handled by the 
+            # 1-second delay between sparks in the main scanning loop.
         else:
             # Simulation for testing without hardware
-            print("SIM: Spark Fired")
-            time.sleep(0.2)
+            print("SIM: 'Spark' ON for 4s")
+            time.sleep(4)
+            print("SIM: 'Spark' OFF")
 
 
     def cleanup(self):
