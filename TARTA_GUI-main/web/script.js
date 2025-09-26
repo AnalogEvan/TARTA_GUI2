@@ -5,6 +5,7 @@ let scanTotals = {cycles:0, sparks:0}, cleanTotals = {cycles:0, sparks:0}, pmTot
 let pmTimerInterval, pmTimeSinceSpark;
 let detectedUsbPath = null;
 let lastScreenId = 'welcome-screen';
+let hourlyCountdownInterval = null; // CHANGED: Added variable for the countdown timer
 
 const screenTitles = {
   'welcome-screen': 'Welcome',
@@ -59,7 +60,6 @@ function updateStatus(elId, connected) {
   el.classList.toggle('disconnected', !connected);
 }
 
-// Expose a function for Python to call to push updates to the UI
 eel.expose(update_ui, 'update_ui');
 function update_ui(msg) {
   console.log("Message from Python:", msg);
@@ -69,45 +69,83 @@ function update_ui(msg) {
     document.getElementById('scan-progress').style.display = 'none';
     document.getElementById('clean-progress').style.display = 'none';
     clearInterval(pmTimerInterval);
+    clearInterval(hourlyCountdownInterval); // CHANGED: Stop countdown on abort/finish
+    id('hourly-monitor-next-event').textContent = '-'; // CHANGED: Reset countdown text
 
     const statusText = msg.includes('STOP') ? 'Operation stopped.' : 'Operation finished.';
-    ['scan-status', 'clean-status', 'pm-status', 'cscan-status', 'cpm-status'].forEach(id => setStatus(id, statusText));
+    ['scan-status', 'clean-status', 'pm-status', 'cscan-status', 'cpm-status', 'hourly-monitor-status'].forEach(id => setStatus(id, statusText));
     return;
   }
   
-  const [type, val] = msg.split(',');
+  const [type, ...rest] = msg.split(',');
+  const val = rest.join(','); // Handle potential commas in the value
   
   if (type === 'CYCLE') {
     id('scan-cycle').textContent = `Cycle: ${val}/${scanTotals.cycles}`;
     id('clean-cycle').textContent = `Cycle: ${val}/${cleanTotals.cycles}`;
-  }
-  if (type === 'SPARK') {
+  } else if (type === 'SPARK') {
     id('scan-spark').textContent = `Spark: ${val}/${scanTotals.sparks}`;
     id('clean-spark').textContent = `Spark: ${val}/${cleanTotals.sparks}`;
-  }
-  if (type === 'TIME_LEFT') {
+  } else if (type === 'TIME_LEFT') {
     let m = Math.floor((+val)/60000);
     let s = Math.floor(((+val)%60000)/1000);
     id('scan-time').textContent = `Time left: ${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  }
+  } else if (type === 'HOURLY_MONITOR_STATUS') {
+    const [status, nextEvent] = val.split(',');
+    setStatus('hourly-monitor-status', status);
+    // The next event text is now handled by the live countdown
+  } else if (type === 'HOURLY_NEXT_EVENT') {
+    // CHANGED: New logic to handle countdown timer updates
+    startHourlyCountdown(val);
+  } else {
+    // This block handles PM monitoring
+    const activeScreen = document.querySelector('.screen.active').id;
+    const prefix = activeScreen.includes('community') ? 'cpm' : 'pm';
 
-  const activeScreen = document.querySelector('.screen.active').id;
-  const prefix = activeScreen.includes('community') ? 'cpm' : 'pm';
-
-  if (type === 'PM_VALUE') {
-      const cur = +val;
-      id(prefix + '-current').textContent = cur;
-      id(prefix + '-bar').value = cur;
-      setStatus(prefix + '-status', `Monitoring... Current Value: ${cur.toFixed(0)}`);
-  } else if (msg.startsWith('SPARK,')) {
-      pmTimeSinceSpark = 0;
-      const sparkNum = msg.split(',')[1];
-      setStatus(prefix + '-status', `Sparking: ${sparkNum}/${pmTotals.sparks}`);
-  } else if (msg === 'PM THRESHOLD REACHED') {
-      setStatus(prefix + '-status', 'Threshold reached, starting sparks...');
-  } else if (msg === 'PM SPARKS COMPLETE') {
-      setStatus(prefix + '-status', 'Sparks complete, restarting monitoring.');
+    if (type === 'PM_VALUE') {
+        const cur = +val;
+        id(prefix + '-current').textContent = cur;
+        id(prefix + '-bar').value = cur;
+        setStatus(prefix + '-status', `Monitoring... Current Value: ${cur.toFixed(0)}`);
+    } else if (msg.startsWith('SPARK,')) {
+        pmTimeSinceSpark = 0;
+        const sparkNum = msg.split(',')[1];
+        setStatus(prefix + '-status', `Sparking: ${sparkNum}/${pmTotals.sparks}`);
+    } else if (msg === 'PM THRESHOLD REACHED') {
+        setStatus(prefix + '-status', 'Threshold reached, starting sparks...');
+    } else if (msg === 'PM SPARKS COMPLETE') {
+        setStatus(prefix + '-status', 'Sparks complete, restarting monitoring.');
+    }
   }
+}
+
+// CHANGED: New function to manage the countdown timer
+function startHourlyCountdown(isoString) {
+  clearInterval(hourlyCountdownInterval); // Clear any old timer
+
+  const targetTime = new Date(isoString);
+  const nextEventEl = id('hourly-monitor-next-event');
+
+  hourlyCountdownInterval = setInterval(() => {
+    const now = new Date();
+    const totalSeconds = Math.round((targetTime - now) / 1000);
+
+    if (totalSeconds <= 0) {
+      clearInterval(hourlyCountdownInterval);
+      nextEventEl.textContent = "Event in progress...";
+      return;
+    }
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    // Display as HH:MM:SS
+    nextEventEl.textContent =
+      `${String(hours).padStart(2, '0')}:` +
+      `${String(minutes).padStart(2, '0')}:` +
+      `${String(seconds).padStart(2, '0')}`;
+  }, 1000);
 }
 
 function startHourlyMonitoring() {
@@ -134,7 +172,7 @@ function startScan() {
       scanTotals = {cycles:c, sparks:s};
       id('scan-cycle').textContent = `Cycle: 0/${c}`;
       id('scan-spark').textContent = `Spark: 0/${s}`;
-      id('scan-time').textContent = `Time left: ${String(d*c).padStart(2,'0')}:00`;
+      id('scan-time').textContent = `Time left: ${String(d).padStart(2,'0')}:00`;
       document.getElementById('scan-progress').style.display = 'flex';
     } else {
       setStatus('scan-status', 'Failed to start. Another operation may be running.');
@@ -216,6 +254,7 @@ function startPmTimer(prefix) {
 
 function abortOp() {
   clearInterval(pmTimerInterval);
+  clearInterval(hourlyCountdownInterval); // CHANGED: Stop countdown on abort
   eel.abort_all()();
 }
 
