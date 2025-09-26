@@ -5,3 +5,5 @@ scipy
 pytz
 psutil
 lgpio
+adafruit-blinka
+adafruit-circuitpython-mcp4725
