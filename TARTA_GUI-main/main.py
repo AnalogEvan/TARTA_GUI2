@@ -8,22 +8,18 @@ import json
 from scipy.signal import find_peaks
 import numpy as np
 import datetime
-import pytz # Added for timezone support
+import pytz
 import shutil
 import psutil
 import sys
 
 # --- RPi specific imports ---
 try:
-    import RPi.GPIO as GPIO
-    import smbus2
-    import board
-    import busio
-    import adafruit_mcp4725
+    import lgpio
     RPI_MODE = True
-    print("Running in Raspberry Pi mode.")
+    print("Running in Raspberry Pi mode using lgpio.")
 except ImportError:
-    print("WARNING: RPi.GPIO, smbus2, or Adafruit libraries not found. Running in simulation mode.")
+    print("WARNING: lgpio library not found. Running in simulation mode.")
     RPI_MODE = False
 
 # --- GPIO and I2C Configuration ---
@@ -60,25 +56,31 @@ def bcd_to_dec(bcd):
     return (bcd // 16 * 10) + (bcd % 16)
 
 def get_rtc_datetime():
-    """Reads the time from a DS3231 RTC module and returns a naive datetime object."""
+    """Reads the time from a DS3231 RTC module using lgpio and returns a naive datetime object."""
     if not RPI_MODE:
         return datetime.datetime.now()
-        
+    
+    h = None
     try:
-        bus = smbus2.SMBus(I2C_BUS)
-        time_data = bus.read_i2c_block_data(DS3231_ADDRESS, 0, 7)
-        bus.close()
+        h = lgpio.i2c_open(I2C_BUS, DS3231_ADDRESS)
+        count, time_data = lgpio.i2c_read_i2c_block_data(h, 0, 7)
+        lgpio.i2c_close(h)
 
-        sec = bcd_to_dec(time_data[0] & 0x7F)
-        minute = bcd_to_dec(time_data[1])
-        hour = bcd_to_dec(time_data[2] & 0x3F)
-        date = bcd_to_dec(time_data[4])
-        month = bcd_to_dec(time_data[5] & 0x1F)
-        year = bcd_to_dec(time_data[6]) + 2000
-        
-        return datetime.datetime(year, month, date, hour, minute, sec)
+        if count == 7:
+            sec = bcd_to_dec(time_data[0] & 0x7F)
+            minute = bcd_to_dec(time_data[1])
+            hour = bcd_to_dec(time_data[2] & 0x3F)
+            date = bcd_to_dec(time_data[4])
+            month = bcd_to_dec(time_data[5] & 0x1F)
+            year = bcd_to_dec(time_data[6]) + 2000
+            
+            return datetime.datetime(year, month, date, hour, minute, sec)
+        else:
+            raise IOError(f"Expected 7 bytes from RTC, got {count}")
 
     except Exception as e:
+        if h is not None:
+            lgpio.i2c_close(h)
         print(f"Error reading from RTC: {e}")
         # Fallback to system time if RTC fails
         return datetime.datetime.now()
@@ -180,45 +182,64 @@ class RPIController:
     def __init__(self):
         self.operation_thread = None
         self.stop_operation = threading.Event()
-        self.dac = None
+        self.gpio_h = None
+        self.dac_h = None
         if RPI_MODE:
-            GPIO.setwarnings(False)
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(RELAY_PIN, GPIO.OUT)
-            GPIO.setup(BOOST_PIN, GPIO.OUT)
-            GPIO.output(RELAY_PIN, GPIO.LOW)
-            GPIO.output(BOOST_PIN, GPIO.LOW)
-            
             try:
-                i2c = busio.I2C(board.SCL, board.SDA)
-                self.dac = adafruit_mcp4725.MCP4725(i2c, address=MCP4725_ADDRESS)
-                self.dac.normalized_value = 0.0
-                print("GPIO pins and MCP4725 DAC initialized.")
+                # Open GPIO chip
+                self.gpio_h = lgpio.gpiochip_open(0)
+                # Claim output pins
+                lgpio.gpio_claim_output(self.gpio_h, RELAY_PIN)
+                lgpio.gpio_claim_output(self.gpio_h, BOOST_PIN)
+                # Set initial state to LOW
+                lgpio.gpio_write(self.gpio_h, RELAY_PIN, 0)
+                lgpio.gpio_write(self.gpio_h, BOOST_PIN, 0)
+                
+                # Open I2C device for DAC
+                self.dac_h = lgpio.i2c_open(I2C_BUS, MCP4725_ADDRESS)
+                self.set_pump(False) # Ensure pump is off on startup
+                print("GPIO pins and MCP4725 DAC initialized using lgpio.")
             except Exception as e:
-                print(f"FATAL: Could not initialize MCP4725 DAC. Error: {e}")
-                self.dac = None
+                print(f"FATAL: Could not initialize hardware. Error: {e}")
+                self.cleanup() # Attempt to clean up any partial initializations
+                self.gpio_h = None
+                self.dac_h = None
+
 
     def set_pump(self, state):
-        if RPI_MODE and self.dac:
-            self.dac.normalized_value = 1.0 if state else 0.0
-        print(f"Pump DAC set to {'1.0 (ON)' if state else '0.0 (OFF)'}")
+        """Sets the MCP4725 DAC output. True = On (max voltage), False = Off (0 voltage)."""
+        if RPI_MODE and self.dac_h is not None:
+            # 12-bit DAC: 0-4095
+            value = 4095 if state else 0
+            # Data for MCP4725 is two bytes: [MSB_8_bits, LSB_4_bits shifted left]
+            data = [(value >> 4), (value & 0x0F) << 4]
+            lgpio.i2c_write_device(self.dac_h, data)
+        print(f"Pump DAC set to {'4095 (ON)' if state else '0 (OFF)'}")
 
     def set_relay(self, state):
-        if RPI_MODE:
-            GPIO.output(RELAY_PIN, GPIO.HIGH if state else GPIO.LOW)
+        if RPI_MODE and self.gpio_h is not None:
+            lgpio.gpio_write(self.gpio_h, RELAY_PIN, 1 if state else 0)
         print(f"Relay set to {'ON' if state else 'OFF'}")
 
     def set_boost(self, state):
-        if RPI_MODE:
-            GPIO.output(BOOST_PIN, GPIO.HIGH if state else GPIO.LOW)
+        if RPI_MODE and self.gpio_h is not None:
+            lgpio.gpio_write(self.gpio_h, BOOST_PIN, 1 if state else 0)
         print(f"Boost set to {'ON' if state else 'OFF'}")
 
     def cleanup(self):
         if RPI_MODE:
-            if self.dac:
-                self.dac.normalized_value = 0.0
-            GPIO.cleanup()
-        print("GPIO cleaned up and pump turned off.")
+            if self.dac_h is not None:
+                try:
+                    self.set_pump(False)
+                    lgpio.i2c_close(self.dac_h)
+                except Exception as e:
+                    print(f"Error closing DAC handle: {e}")
+            if self.gpio_h is not None:
+                try:
+                    lgpio.gpiochip_close(self.gpio_h)
+                except Exception as e:
+                    print(f"Error closing GPIO chip handle: {e}")
+        print("Hardware handles closed and pump turned off.")
 
     def _execute_spark_sequence(self):
         # This is the original, safe timing for the spark.
@@ -324,7 +345,6 @@ class RPIController:
             self.set_pump(True)
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Pumping,Sparking at {spark_start_time.strftime('%H:%M')}")()
             
-            # CHANGED: Send the target time to the frontend for the countdown
             eel.update_ui(f"HOURLY_NEXT_EVENT,{spark_start_time.isoformat()}")()
             
             while pst.localize(get_rtc_datetime()) < spark_start_time:
@@ -340,7 +360,6 @@ class RPIController:
             
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Sparking {sparks} times,Next pump at {next_hour_time.strftime('%H:%M')}")()
             
-            # CHANGED: Send the next target time to the frontend
             eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
 
             for s in range(1, sparks + 1):
@@ -355,7 +374,6 @@ class RPIController:
                     break
             
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Waiting for next hour,Next pump at {next_hour_time.strftime('%H:%M')}")()
-            # CHANGED: Ensure the countdown is updated for the waiting period too
             eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
             while pst.localize(get_rtc_datetime()) < next_hour_time:
                 if self.stop_operation.is_set():
@@ -410,7 +428,7 @@ def abort_all():
     rpi_controller.abort_operation()
     return True
 @eel.expose
-def is_rpi_ready(): return True
+def is_rpi_ready(): return RPI_MODE and rpi_controller.gpio_h is not None and rpi_controller.dac_h is not None
 
 @eel.expose
 def list_scans():
