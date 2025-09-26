@@ -173,11 +173,190 @@ class RPIController:
             self.set_pump(False) # Final safety check
             eel.update_ui('DONE')()
             print("Scan sequence finished.")
+    def run_clean_sequence(self, sparks):
+        print(f"Starting clean: {sparks} sparks")
+        self.stop_operation.clear()
+        eel.update_ui('CYCLE,1')()
 
-    # ... (Other operation sequences like run_clean_sequence, run_pm_sequence, etc.)
-    # ... (Eel exposed functions)
-    # ... (Main execution block)
+        for s in range(1, sparks + 1):
+            if self.stop_operation.is_set(): break
+            eel.update_ui(f'SPARK,{s}')()
+            self._execute_spark_sequence()
+            time.sleep(0.5)
 
-# NOTE: The rest of the file (eel functions, other sequences, etc.) is omitted 
-# for brevity as it does not need to be changed from the previous correct versions.
-# This provided snippet contains all the necessary fixes.
+        eel.update_ui('DONE')()
+        print("Clean sequence finished.")
+        
+    def run_pm_sequence(self, sparks, threshold, pm_type):
+        print(f"Starting PM monitoring: {sparks} sparks, threshold {threshold} for PM{pm_type}")
+        self.stop_operation.clear()
+        
+        try:
+            self.set_pump(True)
+            while not self.stop_operation.is_set():
+                current_pm_value = np.random.randint(0, int(threshold) + 20) 
+                eel.update_ui(f'PM_VALUE,{current_pm_value}')()
+                
+                if current_pm_value >= threshold:
+                    eel.update_ui('PM THRESHOLD REACHED')()
+                    for s in range(1, sparks + 1):
+                        if self.stop_operation.is_set(): break
+                        eel.update_ui(f'SPARK,{s}')()
+                        self._execute_spark_sequence()
+                        time.sleep(0.5)
+                    eel.update_ui('PM SPARKS COMPLETE')()
+                time.sleep(2)
+        finally:
+            self.set_pump(False)
+            print("PM monitoring stopped.")
+
+    def run_hourly_monitoring_sequence(self):
+        """Runs a continuous, time-based pumping and sparking cycle using the RTC."""
+        print("Starting Hourly Monitoring sequence.")
+        self.stop_operation.clear()
+        pst = pytz.timezone('America/Los_Angeles')
+
+        while not self.stop_operation.is_set():
+            try:
+                now_naive = get_rtc_datetime()
+                now = pst.localize(now_naive, is_dst=None)
+            except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError) as e:
+                print(f"Timezone localization error during DST change: {e}. Waiting 5 minutes.")
+                time.sleep(300)
+                continue
+
+            spark_start_time = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=2)
+            if now >= spark_start_time:
+                 spark_start_time += datetime.timedelta(hours=1)
+            
+            next_hour_time = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+
+            self.set_pump(True)
+            eel.update_ui(f"HOURLY_MONITOR_STATUS,Pumping,Sparking at {spark_start_time.strftime('%H:%M')}")()
+            
+            eel.update_ui(f"HOURLY_NEXT_EVENT,{spark_start_time.isoformat()}")()
+            
+            while pst.localize(get_rtc_datetime()) < spark_start_time:
+                if self.stop_operation.is_set():
+                    self.set_pump(False)
+                    print("Hourly Monitoring aborted during pumping.")
+                    return
+                time.sleep(1)
+            
+            self.set_pump(False)
+            now = pst.localize(get_rtc_datetime())
+            sparks = 20 if now.hour == 23 else 15
+            
+            eel.update_ui(f"HOURLY_MONITOR_STATUS,Sparking {sparks} times,Next pump at {next_hour_time.strftime('%H:%M')}")()
+            
+            eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
+
+            for s in range(1, sparks + 1):
+                if self.stop_operation.is_set():
+                    print("Hourly Monitoring aborted during sparking.")
+                    return
+                self._execute_spark_sequence()
+                time.sleep(1)
+
+                if pst.localize(get_rtc_datetime()) >= next_hour_time:
+                    print("Warning: Sparking overran the hour.")
+                    break
+            
+            eel.update_ui(f"HOURLY_MONITOR_STATUS,Waiting for next hour,Next pump at {next_hour_time.strftime('%H:%M')}")()
+            eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
+            while pst.localize(get_rtc_datetime()) < next_hour_time:
+                if self.stop_operation.is_set():
+                    print("Hourly Monitoring aborted during waiting.")
+                    return
+                time.sleep(0.5)
+
+        print("Hourly Monitoring sequence stopped.")
+
+    def start_operation(self, target, *args):
+        if self.operation_thread and self.operation_thread.is_alive():
+            print("Another operation is already in progress.")
+            return False
+        self.stop_operation.clear()
+        self.operation_thread = threading.Thread(target=target, args=args)
+        self.operation_thread.daemon = True
+        self.operation_thread.start()
+        return True
+
+    def abort_operation(self):
+        if self.operation_thread and self.operation_thread.is_alive():
+            self.stop_operation.set()
+            eel.update_ui('STOPPED')()
+            print("Abort signal sent.")
+        else:
+            print("No operation to abort.")
+
+@eel.expose
+def get_rtc_time_str():
+    return get_rtc_datetime().strftime("%Y-%m-%d %H:%M:%S")
+
+eel.init('web')
+rpi_controller = RPIController()
+
+@eel.expose
+def close_app():
+    print("Close request received from frontend. Shutting down.")
+    sys.exit(0)
+
+@eel.expose
+def get_config(): return config
+@eel.expose
+def start_scan(duration, sparks, cycles): return rpi_controller.start_operation(rpi_controller.run_scan_sequence, duration, sparks, cycles)
+@eel.expose
+def start_clean(sparks): return rpi_controller.start_operation(rpi_controller.run_clean_sequence, sparks)
+@eel.expose
+def start_pm(sparks, threshold, pm_type): return rpi_controller.start_operation(rpi_controller.run_pm_sequence, int(sparks), int(threshold), pm_type)
+@eel.expose
+def start_hourly_monitoring(): return rpi_controller.start_operation(rpi_controller.run_hourly_monitoring_sequence)
+@eel.expose
+def abort_all():
+    rpi_controller.abort_operation()
+    return True
+@eel.expose
+def is_rpi_ready(): return RPI_MODE and rpi_controller.gpio_h is not None and rpi_controller.dac_h is not None
+
+@eel.expose
+def list_scans():
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
+    if not os.path.exists(output_path): os.makedirs(output_path)
+    files = sorted(glob.glob(os.path.join(output_path, '*.csv')), key=os.path.getmtime, reverse=True)
+    return [os.path.basename(f) for f in files]
+@eel.expose
+def get_scan_data(filename):
+    full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output', filename)
+    if not os.path.exists(full_path): return {'x': [], 'y': [], 'peaks': []}
+    df = pd.read_csv(full_path)
+    x, y = df.iloc[:,0].tolist(), df.iloc[:,1].tolist()
+    peaks, _ = find_peaks(y, height=6500, distance=50)
+    return {'x': x, 'y': y, 'peaks': peaks.tolist()}
+@eel.expose
+def get_scan_data_avg():
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
+    files = sorted(glob.glob(os.path.join(output_path, '*.csv')), key=os.path.getmtime, reverse=True)[:10]
+    if not files: return {'x': [], 'y': [], 'peaks': []}
+    dfs = [pd.read_csv(f) for f in files]
+    min_len = min(len(df) for df in dfs)
+    dfs_trimmed = [df.iloc[:min_len, :] for df in dfs]
+    combined_df = pd.concat(dfs_trimmed)
+    avg_df = combined_df.groupby(combined_df.columns[0])[combined_df.columns[1]].mean().reset_index()
+    x, y = avg_df.iloc[:,0].tolist(), avg_df.iloc[:,1].tolist()
+    peaks, _ = find_peaks(y, height=6500, distance=50)
+    return {'x': x, 'y': y, 'peaks': peaks.tolist()}
+
+if __name__ == '__main__':
+    try:
+        usb_thread = threading.Thread(target=monitor_usb_drives)
+        usb_thread.daemon = True
+        usb_thread.start()
+        
+        eel.start('index.html', size=(1280, 800))
+    except (SystemExit, MemoryError, KeyboardInterrupt):
+        print("UI closed, shutting down application.")
+    finally:
+        rpi_controller.abort_operation()
+        rpi_controller.cleanup()
+        print("Application has been shut down.")
