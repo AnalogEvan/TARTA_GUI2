@@ -27,12 +27,11 @@ except ImportError:
     RPI_MODE = False
 
 # --- GPIO and I2C Configuration ---
-# PUMP_PIN is no longer needed for direct control
 RELAY_PIN = 6
 BOOST_PIN = 13
 I2C_BUS = 1
 DS3231_ADDRESS = 0x68
-MCP4725_ADDRESS = 0x62 # Default I2C address for the MCP4725
+MCP4725_ADDRESS = 0x60 # Default I2C address for the MCP4725
 
 def load_config():
     """
@@ -106,8 +105,6 @@ def monitor_usb_drives():
         try:
             current_mounts = set()
             for part in psutil.disk_partitions(all=False): # all=False to ignore devices not ready
-                 # Check for removable drives that HAVE a filesystem type.
-                 # This helps filter out empty CD/DVD drives which have an empty fstype.
                  if 'removable' in part.opts and part.fstype:
                     current_mounts.add(part.mountpoint)
             
@@ -132,8 +129,6 @@ def copy_data_to_usb(mount_point):
     source_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
     dest_dir = os.path.join(mount_point, 'TARTA_OUTPUT')
     
-    # --- Retry Loop ---
-    # Wait for the drive to be fully ready before attempting to write.
     max_retries = 5
     retry_delay = 1 # in seconds
     drive_ready = False
@@ -179,7 +174,7 @@ def copy_data_to_usb(mount_point):
     except Exception as e:
         print(f"Error copying files to USB: {e}")
         eel.usb_copy_status('error', f'Error: Could not write to drive.')()
-        
+
 # --- RPi Controller ---
 class RPIController:
     def __init__(self):
@@ -189,26 +184,21 @@ class RPIController:
         if RPI_MODE:
             GPIO.setwarnings(False)
             GPIO.setmode(GPIO.BCM)
-            # GPIO setup for pump is removed
             GPIO.setup(RELAY_PIN, GPIO.OUT)
             GPIO.setup(BOOST_PIN, GPIO.OUT)
             GPIO.output(RELAY_PIN, GPIO.LOW)
             GPIO.output(BOOST_PIN, GPIO.LOW)
             
             try:
-                # Initialize I2C bus and MCP4725 DAC
                 i2c = busio.I2C(board.SCL, board.SDA)
                 self.dac = adafruit_mcp4725.MCP4725(i2c, address=MCP4725_ADDRESS)
-                self.dac.normalized_value = 0.0 # Ensure pump is off at start
+                self.dac.normalized_value = 0.0
                 print("GPIO pins and MCP4725 DAC initialized.")
             except Exception as e:
                 print(f"FATAL: Could not initialize MCP4725 DAC. Error: {e}")
-                # Potentially exit or handle the error appropriately
                 self.dac = None
 
-
     def set_pump(self, state):
-        # Control motor via DAC
         if RPI_MODE and self.dac:
             self.dac.normalized_value = 1.0 if state else 0.0
         print(f"Pump DAC set to {'1.0 (ON)' if state else '0.0 (OFF)'}")
@@ -225,21 +215,16 @@ class RPIController:
 
     def cleanup(self):
         if RPI_MODE:
-            # Set pump DAC to off before cleaning up GPIO
             if self.dac:
                 self.dac.normalized_value = 0.0
             GPIO.cleanup()
         print("GPIO cleaned up and pump turned off.")
 
-    # CHANGED: Consolidated spark logic into one method with test.py timing
     def _execute_spark_sequence(self):
-        """Executes a single spark using the timing from test.py. WARNING: RISKS HARDWARE DAMAGE."""
-        self.set_boost(True)
-        self.set_relay(True)
-        time.sleep(4)  # Hold components on for 4 seconds
-        self.set_relay(False)
-        self.set_boost(False)
-
+        # This is the original, safe timing for the spark.
+        self.set_boost(True); time.sleep(0.1)
+        self.set_relay(True); time.sleep(0.05)
+        self.set_relay(False); self.set_boost(False)
 
     def run_scan_sequence(self, duration_min, sparks, cycles):
         print(f"Starting scan: {duration_min} mins, {sparks} sparks, {cycles} cycles")
@@ -259,18 +244,16 @@ class RPIController:
                 for s in range(1, sparks + 1):
                     if self.stop_operation.is_set(): break
                     eel.update_ui(f'SPARK,{s}')()
-                    
-                    self._execute_spark_sequence() # CHANGED: Using the new spark method
+                    self._execute_spark_sequence()
                     
                     elapsed_time = time.time() - start_time
                     time_left_ms = max(0, (total_duration_sec - elapsed_time) * 1000)
                     eel.update_ui(f'TIME_LEFT,{int(time_left_ms)}')()
-                    time.sleep(1) # Note: there is an additional 1-second wait here after the spark
+                    time.sleep(1)
                 
                 cycle_duration = total_duration_sec / cycles
                 while time.time() - cycle_start_time < cycle_duration:
                     if self.stop_operation.is_set(): break
-                    
                     elapsed_time = time.time() - start_time
                     time_left_ms = max(0, (total_duration_sec - elapsed_time) * 1000)
                     eel.update_ui(f'TIME_LEFT,{int(time_left_ms)}')()
@@ -280,7 +263,6 @@ class RPIController:
             eel.update_ui('DONE')()
             print("Scan sequence finished.")
 
-
     def run_clean_sequence(self, sparks):
         print(f"Starting clean: {sparks} sparks")
         self.stop_operation.clear()
@@ -289,7 +271,7 @@ class RPIController:
         for s in range(1, sparks + 1):
             if self.stop_operation.is_set(): break
             eel.update_ui(f'SPARK,{s}')()
-            self._execute_spark_sequence() # CHANGED: Using the new spark method
+            self._execute_spark_sequence()
             time.sleep(0.5)
 
         eel.update_ui('DONE')()
@@ -310,15 +292,13 @@ class RPIController:
                     for s in range(1, sparks + 1):
                         if self.stop_operation.is_set(): break
                         eel.update_ui(f'SPARK,{s}')()
-                        self._execute_spark_sequence() # CHANGED: Using the new spark method
+                        self._execute_spark_sequence()
                         time.sleep(0.5)
                     eel.update_ui('PM SPARKS COMPLETE')()
-                
                 time.sleep(2)
         finally:
             self.set_pump(False)
             print("PM monitoring stopped.")
-
 
     def run_hourly_monitoring_sequence(self):
         """Runs a continuous, time-based pumping and sparking cycle using the RTC."""
@@ -344,6 +324,9 @@ class RPIController:
             self.set_pump(True)
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Pumping,Sparking at {spark_start_time.strftime('%H:%M')}")()
             
+            # CHANGED: Send the target time to the frontend for the countdown
+            eel.update_ui(f"HOURLY_NEXT_EVENT,{spark_start_time.isoformat()}")()
+            
             while pst.localize(get_rtc_datetime()) < spark_start_time:
                 if self.stop_operation.is_set():
                     self.set_pump(False)
@@ -356,12 +339,15 @@ class RPIController:
             sparks = 20 if now.hour == 23 else 15
             
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Sparking {sparks} times,Next pump at {next_hour_time.strftime('%H:%M')}")()
+            
+            # CHANGED: Send the next target time to the frontend
+            eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
 
             for s in range(1, sparks + 1):
                 if self.stop_operation.is_set():
                     print("Hourly Monitoring aborted during sparking.")
                     return
-                self._execute_spark_sequence() # CHANGED: Using the new spark method
+                self._execute_spark_sequence()
                 time.sleep(1)
 
                 if pst.localize(get_rtc_datetime()) >= next_hour_time:
@@ -369,6 +355,8 @@ class RPIController:
                     break
             
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Waiting for next hour,Next pump at {next_hour_time.strftime('%H:%M')}")()
+            # CHANGED: Ensure the countdown is updated for the waiting period too
+            eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
             while pst.localize(get_rtc_datetime()) < next_hour_time:
                 if self.stop_operation.is_set():
                     print("Hourly Monitoring aborted during waiting.")
@@ -377,7 +365,6 @@ class RPIController:
 
         print("Hourly Monitoring sequence stopped.")
 
-    # ... (the rest of the class methods start_operation and abort_operation remain the same) ...
     def start_operation(self, target, *args):
         if self.operation_thread and self.operation_thread.is_alive():
             print("Another operation is already in progress.")
@@ -398,7 +385,6 @@ class RPIController:
 
 @eel.expose
 def get_rtc_time_str():
-    """Exposes the RTC time as a formatted string to the frontend."""
     return get_rtc_datetime().strftime("%Y-%m-%d %H:%M:%S")
 
 eel.init('web')
@@ -406,7 +392,6 @@ rpi_controller = RPIController()
 
 @eel.expose
 def close_app():
-    """Exposed function to close the application from the frontend."""
     print("Close request received from frontend. Shutting down.")
     sys.exit(0)
 
@@ -457,7 +442,6 @@ def get_scan_data_avg():
 
 if __name__ == '__main__':
     try:
-        # Start the USB monitoring thread
         usb_thread = threading.Thread(target=monitor_usb_drives)
         usb_thread.daemon = True
         usb_thread.start()
@@ -469,4 +453,3 @@ if __name__ == '__main__':
         rpi_controller.abort_operation()
         rpi_controller.cleanup()
         print("Application has been shut down.")
-
