@@ -179,7 +179,7 @@ def copy_data_to_usb(mount_point):
     except Exception as e:
         print(f"Error copying files to USB: {e}")
         eel.usb_copy_status('error', f'Error: Could not write to drive.')()
-
+        
 # --- RPi Controller ---
 class RPIController:
     def __init__(self):
@@ -231,45 +231,55 @@ class RPIController:
             GPIO.cleanup()
         print("GPIO cleaned up and pump turned off.")
 
+    # CHANGED: Consolidated spark logic into one method with test.py timing
+    def _execute_spark_sequence(self):
+        """Executes a single spark using the timing from test.py. WARNING: RISKS HARDWARE DAMAGE."""
+        self.set_boost(True)
+        self.set_relay(True)
+        time.sleep(4)  # Hold components on for 4 seconds
+        self.set_relay(False)
+        self.set_boost(False)
+
+
     def run_scan_sequence(self, duration_min, sparks, cycles):
         print(f"Starting scan: {duration_min} mins, {sparks} sparks, {cycles} cycles")
         self.stop_operation.clear()
         
-        total_duration_sec = duration_min * 60
-        start_time = time.time()
+        try:
+            self.set_pump(True)
+            total_duration_sec = duration_min * 60
+            start_time = time.time()
 
-        for c in range(1, cycles + 1):
-            if self.stop_operation.is_set(): break
-            eel.update_ui(f'CYCLE,{c}')()
-            
-            cycle_start_time = time.time()
-            
-            for s in range(1, sparks + 1):
+            for c in range(1, cycles + 1):
                 if self.stop_operation.is_set(): break
-                eel.update_ui(f'SPARK,{s}')()
+                eel.update_ui(f'CYCLE,{c}')()
                 
-                self.set_boost(True); time.sleep(0.1)
-                self.set_relay(True); time.sleep(0.05)
-                self.set_relay(False); self.set_boost(False)
+                cycle_start_time = time.time()
                 
-                elapsed_time = time.time() - start_time
-                time_left_ms = max(0, (total_duration_sec - elapsed_time) * 1000)
-                eel.update_ui(f'TIME_LEFT,{int(time_left_ms)}')()
-                time.sleep(1)
-            
-            # Corrected waiting logic to ensure accurate cycle timing
-            cycle_duration = total_duration_sec / cycles
-            while time.time() - cycle_start_time < cycle_duration:
-                if self.stop_operation.is_set(): break
+                for s in range(1, sparks + 1):
+                    if self.stop_operation.is_set(): break
+                    eel.update_ui(f'SPARK,{s}')()
+                    
+                    self._execute_spark_sequence() # CHANGED: Using the new spark method
+                    
+                    elapsed_time = time.time() - start_time
+                    time_left_ms = max(0, (total_duration_sec - elapsed_time) * 1000)
+                    eel.update_ui(f'TIME_LEFT,{int(time_left_ms)}')()
+                    time.sleep(1) # Note: there is an additional 1-second wait here after the spark
                 
-                # Update overall time left during the wait period
-                elapsed_time = time.time() - start_time
-                time_left_ms = max(0, (total_duration_sec - elapsed_time) * 1000)
-                eel.update_ui(f'TIME_LEFT,{int(time_left_ms)}')()
-                time.sleep(0.5)
+                cycle_duration = total_duration_sec / cycles
+                while time.time() - cycle_start_time < cycle_duration:
+                    if self.stop_operation.is_set(): break
+                    
+                    elapsed_time = time.time() - start_time
+                    time_left_ms = max(0, (total_duration_sec - elapsed_time) * 1000)
+                    eel.update_ui(f'TIME_LEFT,{int(time_left_ms)}')()
+                    time.sleep(0.5)
+        finally:
+            self.set_pump(False)
+            eel.update_ui('DONE')()
+            print("Scan sequence finished.")
 
-        eel.update_ui('DONE')()
-        print("Scan sequence finished.")
 
     def run_clean_sequence(self, sparks):
         print(f"Starting clean: {sparks} sparks")
@@ -279,9 +289,7 @@ class RPIController:
         for s in range(1, sparks + 1):
             if self.stop_operation.is_set(): break
             eel.update_ui(f'SPARK,{s}')()
-            self.set_boost(True); time.sleep(0.1)
-            self.set_relay(True); time.sleep(0.05)
-            self.set_relay(False); self.set_boost(False)
+            self._execute_spark_sequence() # CHANGED: Using the new spark method
             time.sleep(0.5)
 
         eel.update_ui('DONE')()
@@ -290,24 +298,27 @@ class RPIController:
     def run_pm_sequence(self, sparks, threshold, pm_type):
         print(f"Starting PM monitoring: {sparks} sparks, threshold {threshold} for PM{pm_type}")
         self.stop_operation.clear()
+        
+        try:
+            self.set_pump(True)
+            while not self.stop_operation.is_set():
+                current_pm_value = np.random.randint(0, int(threshold) + 20) 
+                eel.update_ui(f'PM_VALUE,{current_pm_value}')()
+                
+                if current_pm_value >= threshold:
+                    eel.update_ui('PM THRESHOLD REACHED')()
+                    for s in range(1, sparks + 1):
+                        if self.stop_operation.is_set(): break
+                        eel.update_ui(f'SPARK,{s}')()
+                        self._execute_spark_sequence() # CHANGED: Using the new spark method
+                        time.sleep(0.5)
+                    eel.update_ui('PM SPARKS COMPLETE')()
+                
+                time.sleep(2)
+        finally:
+            self.set_pump(False)
+            print("PM monitoring stopped.")
 
-        while not self.stop_operation.is_set():
-            current_pm_value = np.random.randint(0, int(threshold) + 20) 
-            eel.update_ui(f'PM_VALUE,{current_pm_value}')()
-            
-            if current_pm_value >= threshold:
-                eel.update_ui('PM THRESHOLD REACHED')()
-                for s in range(1, sparks + 1):
-                    if self.stop_operation.is_set(): break
-                    eel.update_ui(f'SPARK,{s}')()
-                    self.set_boost(True); time.sleep(0.1)
-                    self.set_relay(True); time.sleep(0.05)
-                    self.set_relay(False); self.set_boost(False)
-                    time.sleep(0.5)
-                eel.update_ui('PM SPARKS COMPLETE')()
-            
-            time.sleep(2)
-        print("PM monitoring stopped.")
 
     def run_hourly_monitoring_sequence(self):
         """Runs a continuous, time-based pumping and sparking cycle using the RTC."""
@@ -317,7 +328,6 @@ class RPIController:
 
         while not self.stop_operation.is_set():
             try:
-                # Get current time from RTC and localize it
                 now_naive = get_rtc_datetime()
                 now = pst.localize(now_naive, is_dst=None)
             except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError) as e:
@@ -343,7 +353,7 @@ class RPIController:
             
             self.set_pump(False)
             now = pst.localize(get_rtc_datetime())
-            sparks = 20 if now.hour == 23 else 15 # 11 PM PST is midnight UTC-ish
+            sparks = 20 if now.hour == 23 else 15
             
             eel.update_ui(f"HOURLY_MONITOR_STATUS,Sparking {sparks} times,Next pump at {next_hour_time.strftime('%H:%M')}")()
 
@@ -351,9 +361,7 @@ class RPIController:
                 if self.stop_operation.is_set():
                     print("Hourly Monitoring aborted during sparking.")
                     return
-                self.set_boost(True); time.sleep(0.1)
-                self.set_relay(True); time.sleep(0.05)
-                self.set_relay(False); self.set_boost(False)
+                self._execute_spark_sequence() # CHANGED: Using the new spark method
                 time.sleep(1)
 
                 if pst.localize(get_rtc_datetime()) >= next_hour_time:
@@ -369,7 +377,7 @@ class RPIController:
 
         print("Hourly Monitoring sequence stopped.")
 
-
+    # ... (the rest of the class methods start_operation and abort_operation remain the same) ...
     def start_operation(self, target, *args):
         if self.operation_thread and self.operation_thread.is_alive():
             print("Another operation is already in progress.")
