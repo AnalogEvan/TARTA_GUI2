@@ -320,51 +320,60 @@ class RPIController:
         print("Starting Hourly Monitoring sequence.")
         self.stop_operation.clear()
         pst = pytz.timezone('America/Los_Angeles')
+        pump_duration_seconds = 120 # Pump for 2 minutes
 
         while not self.stop_operation.is_set():
             try:
+                # --- PUMPING STAGE ---
+                self.set_pump(True)
+                eel.update_ui(f"HOURLY_MONITOR_STATUS,Pumping for {pump_duration_seconds / 60:.0f} minutes,")()
+                
+                pump_start_time = time.time()
+                while time.time() - pump_start_time < pump_duration_seconds:
+                    if self.stop_operation.is_set():
+                        self.set_pump(False)
+                        print("Hourly Monitoring aborted during pumping.")
+                        return
+                    time.sleep(1)
+                
+                self.set_pump(False)
+
+                # --- SPARKING STAGE ---
                 now_naive = get_rtc_datetime()
                 now = pst.localize(now_naive, is_dst=None)
+                sparks = 20 if now.hour == 23 else 15
+                
+                eel.update_ui(f"HOURLY_MONITOR_STATUS,Sparking {sparks} times,")()
+
+                for s in range(1, sparks + 1):
+                    if self.stop_operation.is_set():
+                        print("Hourly Monitoring aborted during sparking.")
+                        return
+                    self._execute_spark_sequence()
+                    time.sleep(2) # Wait between sparks
+
+                # --- WAITING STAGE ---
+                next_hour_time_naive = (now_naive + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                next_hour_time = pst.localize(next_hour_time_naive, is_dst=None)
+                
+                eel.update_ui(f"HOURLY_MONITOR_STATUS,Waiting for next hour,Next cycle at {next_hour_time.strftime('%H:%M')}")()
+                eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
+                
+                while get_rtc_datetime() < next_hour_time_naive:
+                    if self.stop_operation.is_set():
+                        print("Hourly Monitoring aborted during waiting.")
+                        return
+                    time.sleep(1)
+
             except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError) as e:
                 print(f"Timezone localization error: {e}. Waiting 5 minutes.")
                 time.sleep(300)
                 continue
+            except Exception as e:
+                print(f"An unexpected error occurred in hourly monitor: {e}")
+                print("Waiting 5 minutes before retrying.")
+                time.sleep(300)
 
-            spark_start_time = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=2)
-            if now >= spark_start_time:
-                spark_start_time += datetime.timedelta(hours=1)
-            
-            next_hour_time = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-
-            self.set_pump(True)
-            eel.update_ui(f"HOURLY_MONITOR_STATUS,Pumping,Sparking at {spark_start_time.strftime('%H:%M')}")()
-            eel.update_ui(f"HOURLY_NEXT_EVENT,{spark_start_time.isoformat()}")()
-            
-            while pst.localize(get_rtc_datetime()) < spark_start_time:
-                if self.stop_operation.is_set():
-                    self.set_pump(False)
-                    return
-                time.sleep(1)
-            
-            self.set_pump(False)
-            now = pst.localize(get_rtc_datetime())
-            sparks = 20 if now.hour == 23 else 15
-            
-            eel.update_ui(f"HOURLY_MONITOR_STATUS,Sparking {sparks} times,Next pump at {next_hour_time.strftime('%H:%M')}")()
-            eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
-
-            for s in range(1, sparks + 1):
-                if self.stop_operation.is_set(): return
-                self._execute_spark_sequence()
-                time.sleep(2)
-                if pst.localize(get_rtc_datetime()) >= next_hour_time:
-                    break
-            
-            eel.update_ui(f"HOURLY_MONITOR_STATUS,Waiting for next hour,Next pump at {next_hour_time.strftime('%H:%M')}")()
-            eel.update_ui(f"HOURLY_NEXT_EVENT,{next_hour_time.isoformat()}")()
-            while pst.localize(get_rtc_datetime()) < next_hour_time:
-                if self.stop_operation.is_set(): return
-                time.sleep(0.5)
 
     def start_operation(self, target, *args):
         if self.operation_thread and self.operation_thread.is_alive():
